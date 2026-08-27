@@ -5,3 +5,4 @@ __pycache__/
 data/owner.txt
 data/clients/*
 !data/clients/.gitkeep
+requirements.txt

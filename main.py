@@ -26,7 +26,17 @@ from dotenv import load_dotenv
 
 
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
+load_dotenv()
+
+
+def resolve_storage_root(raw_path: str) -> Path:
+    path = Path(raw_path).expanduser()
+    if not path.is_absolute():
+        path = BASE_DIR / path
+    return path.resolve()
+
+
+DATA_DIR = resolve_storage_root(os.getenv("STORAGE_ROOT", "data"))
 CLIENTS_DIR = DATA_DIR / "clients"
 TEMPLATES_DIR = BASE_DIR / "templates"
 OWNER_FILE = DATA_DIR / "owner.txt"
@@ -94,7 +104,8 @@ def confirmation_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="Все верно", callback_data="fill:ok")],
-            [InlineKeyboardButton(text="Отменить", callback_data="menu")],
+            [InlineKeyboardButton(text="Изменить данные", callback_data="fill:edit")],
+            [InlineKeyboardButton(text="В меню", callback_data="menu")],
         ]
     )
 
@@ -206,6 +217,55 @@ def mask_value(field: str, value: str) -> str:
     digits = re.sub(r"\D", "", value)
     tail = digits[-4:] if len(digits) >= 4 else value[-2:]
     return f"***{tail}"
+
+
+def field_label(field: str) -> str:
+    return FIELD_LABELS.get(field, field)
+
+
+def normalize_label(label: str) -> str:
+    return re.sub(r"[\W_]+", "", label.lower(), flags=re.UNICODE)
+
+
+def build_fields_prompt(fields: list[str], values: dict[str, str] | None = None) -> str:
+    lines = [
+        "Заполните данные одним сообщением.",
+        "Скопируйте форму ниже и впишите значения:",
+        "",
+    ]
+    lines.extend(f"{field_label(field)}: {(values or {}).get(field, '')}" for field in fields)
+    return "\n".join(lines)
+
+
+def parse_document_values(text: str, fields: list[str]) -> tuple[dict[str, str], list[str]]:
+    label_to_field: dict[str, str] = {}
+    for field in fields:
+        label_to_field[normalize_label(field)] = field
+        label_to_field[normalize_label(field_label(field))] = field
+
+    values: dict[str, str] = {}
+    positional_lines: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        if ":" in line:
+            label, value = line.split(":", 1)
+            field = label_to_field.get(normalize_label(label))
+            if field:
+                values[field] = value.strip()
+                continue
+
+        positional_lines.append(line)
+
+    remaining_fields = [field for field in fields if not values.get(field)]
+    if len(positional_lines) == len(remaining_fields):
+        for field, value in zip(remaining_fields, positional_lines):
+            values[field] = value.strip()
+
+    missing = [field for field in fields if not values.get(field)]
+    return values, missing
 
 
 async def is_owner(message_or_callback: Message | CallbackQuery) -> bool:
@@ -554,15 +614,11 @@ async def fill_template_choose_client(callback: CallbackQuery, state: FSMContext
         return
 
     fields = data["fields"]
-    first_field = fields[0]
-    await state.update_data(selected_client=clients[index], current_field_index=0)
+    await state.update_data(selected_client=clients[index])
     await state.set_state(BotStates.fill_template_ask_field)
     await callback.answer()
     if callback.message:
-        await callback.message.answer(
-            f"Введите поле: {FIELD_LABELS.get(first_field, first_field)}",
-            reply_markup=menu_inline_keyboard(),
-        )
+        await callback.message.answer(build_fields_prompt(fields), reply_markup=menu_inline_keyboard())
 
 
 @router.message(BotStates.fill_template_ask_field)
@@ -570,21 +626,16 @@ async def fill_template_collect_field(message: Message, state: FSMContext) -> No
     if await reject_if_not_owner(message):
         return
     if not message.text:
-        await message.answer("Введите значение текстом.", reply_markup=menu_inline_keyboard())
+        await message.answer("Пришлите заполненные данные текстом.", reply_markup=menu_inline_keyboard())
         return
 
     data = await state.get_data()
     fields = data["fields"]
-    index = data["current_field_index"]
-    values = data.get("values", {})
-    values[fields[index]] = message.text.strip()
-    index += 1
-
-    if index < len(fields):
-        await state.update_data(values=values, current_field_index=index)
-        next_field = fields[index]
+    values, missing = parse_document_values(message.text, fields)
+    if missing:
+        missing_labels = ", ".join(field_label(field) for field in missing)
         await message.answer(
-            f"Введите поле: {FIELD_LABELS.get(next_field, next_field)}",
+            f"Не вижу обязательные поля: {missing_labels}\n\n{build_fields_prompt(fields)}",
             reply_markup=menu_inline_keyboard(),
         )
         return
@@ -597,7 +648,7 @@ async def fill_template_collect_field(message: Message, state: FSMContext) -> No
         f"Шаблон: {data['selected_template']}",
     ]
     for field in fields:
-        label = FIELD_LABELS.get(field, field)
+        label = field_label(field)
         lines.append(f"{label}: {mask_value(field, values[field])}")
     await message.answer("\n".join(lines), reply_markup=confirmation_keyboard())
 
@@ -625,6 +676,24 @@ async def fill_template_finish(callback: CallbackQuery, state: FSMContext) -> No
         relative_path = output_path.relative_to(BASE_DIR).as_posix()
         await callback.message.answer(f"Документ готов: {relative_path}", reply_markup=main_menu_keyboard())
         await callback.message.answer_document(FSInputFile(output_path), caption="Готовый документ")
+
+
+@router.callback_query(BotStates.fill_template_confirm, F.data == "fill:edit")
+async def fill_template_edit(callback: CallbackQuery, state: FSMContext) -> None:
+    if await reject_if_not_owner(callback):
+        return
+
+    data = await state.get_data()
+    fields = data["fields"]
+    values = data.get("values", {})
+    await state.set_state(BotStates.fill_template_ask_field)
+    await callback.answer()
+    if callback.message:
+        await callback.message.answer(
+            "Ок, поправьте данные и пришлите форму заново:\n\n"
+            + build_fields_prompt(fields, values),
+            reply_markup=menu_inline_keyboard(),
+        )
 
 
 @router.message(F.text.in_({"Меню", "В меню"}))
