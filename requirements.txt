@@ -1,3 +1,0 @@
-aiogram>=3.6,<4
-python-docx>=1.1,<2
-python-dotenv>=1.0,<2
