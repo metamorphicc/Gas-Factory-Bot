@@ -1,4 +1,4 @@
-import asyncio
+﻿import asyncio
 import logging
 import os
 import re
@@ -198,6 +198,21 @@ def safe_child_path(root: Path, name: str) -> Path:
     return candidate
 
 
+def user_id_from(message_or_callback: Message | CallbackQuery) -> int | None:
+    user = message_or_callback.from_user
+    return user.id if user else None
+
+
+def display_path(path: Path) -> str:
+    resolved = path.resolve()
+    for root in (BASE_DIR.resolve(), DATA_DIR.resolve()):
+        try:
+            return resolved.relative_to(root).as_posix()
+        except ValueError:
+            continue
+    return resolved.as_posix()
+
+
 def client_names() -> list[str]:
     ensure_storage()
     return sorted(path.name for path in CLIENTS_DIR.iterdir() if path.is_dir())
@@ -331,25 +346,27 @@ def parse_document_values(text: str, fields: list[str]) -> tuple[dict[str, str],
 
 
 async def is_owner(message_or_callback: Message | CallbackQuery) -> bool:
-    user = message_or_callback.from_user
-    if user is None:
+    user_id = user_id_from(message_or_callback)
+    if user_id is None:
         return False
 
-    user_id = str(user.id)
+    configured_owner_id = os.getenv("OWNER_TELEGRAM_ID", "").strip()
+    if configured_owner_id:
+        return configured_owner_id == str(user_id)
+
     ensure_storage()
     if not OWNER_FILE.exists():
-        OWNER_FILE.write_text(user_id, encoding="utf-8")
+        OWNER_FILE.write_text(str(user_id), encoding="utf-8")
         return True
 
-    owner_id = OWNER_FILE.read_text(encoding="utf-8").strip()
-    return owner_id == user_id
+    return OWNER_FILE.read_text(encoding="utf-8").strip() == str(user_id)
 
 
 async def reject_if_not_owner(message_or_callback: Message | CallbackQuery) -> bool:
     if await is_owner(message_or_callback):
         return False
 
-    text = "Этот MVP доступен только пользователю, который первым запустил демо-сессию."
+    text = "Доступ закрыт. Этим ботом может пользоваться только владелец."
     if isinstance(message_or_callback, CallbackQuery):
         await message_or_callback.answer("Доступ закрыт", show_alert=True)
         if message_or_callback.message:
@@ -478,13 +495,13 @@ async def add_client_finish(message: Message, state: FSMContext, bot: Bot) -> No
     await clear_flow_messages(bot, state, message.chat.id)
     if client_path.exists():
         await message.answer(
-            f"Главное меню\n\nКлиент уже есть: data/clients/{client_name}",
+            f"Главное меню\n\nКлиент уже есть: {display_path(client_path)}",
             reply_markup=main_menu_keyboard(),
         )
     else:
         client_path.mkdir(parents=True, exist_ok=False)
         await message.answer(
-            f"Главное меню\n\nКлиент добавлен: data/clients/{client_name}",
+            f"Главное меню\n\nКлиент добавлен: {display_path(client_path)}",
             reply_markup=main_menu_keyboard(),
         )
     await state.clear()
@@ -575,7 +592,7 @@ async def add_file_receive(message: Message, state: FSMContext, bot: Bot) -> Non
     await bot.download_file(telegram_file.file_path, destination=target_path)
     await clear_flow_messages(bot, state, message.chat.id)
     await state.clear()
-    relative_path = target_path.relative_to(BASE_DIR).as_posix()
+    relative_path = display_path(target_path)
     await message.answer(
         f"Главное меню\n\nФайл сохранен: {relative_path}",
         reply_markup=main_menu_keyboard(),
@@ -777,7 +794,7 @@ async def fill_template_finish(callback: CallbackQuery, state: FSMContext, bot: 
     await state.clear()
     await callback.answer()
     if callback.message:
-        relative_path = output_path.relative_to(BASE_DIR).as_posix()
+        relative_path = display_path(output_path)
         await callback.message.answer(
             f"Главное меню\n\nДокумент готов: {relative_path}",
             reply_markup=main_menu_keyboard(),
