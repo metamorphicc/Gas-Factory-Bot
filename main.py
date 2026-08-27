@@ -1,4 +1,4 @@
-import asyncio
+﻿import asyncio
 import logging
 import os
 import re
@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -44,6 +45,8 @@ OWNER_FILE = DATA_DIR / "owner.txt"
 ALLOWED_EXTENSIONS = {".pdf", ".doc", ".docx", ".jpg", ".jpeg", ".png"}
 MAX_FILE_SIZE = 20 * 1024 * 1024
 PLACEHOLDER_RE = re.compile(r"{{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*}}")
+FLOW_MESSAGES_KEY = "flow_message_ids"
+SCREEN_MESSAGE_IDS: dict[int, list[int]] = {}
 
 FIELD_LABELS = {
     "full_name": "ФИО",
@@ -119,6 +122,65 @@ def rows_keyboard(prefix: str, items: list[str]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+async def remember_flow_message(state: FSMContext, message: Message) -> None:
+    data = await state.get_data()
+    messages = data.get(FLOW_MESSAGES_KEY, [])
+    item = {"chat_id": message.chat.id, "message_id": message.message_id}
+    if item not in messages:
+        messages.append(item)
+        await state.update_data(**{FLOW_MESSAGES_KEY: messages})
+
+
+def remember_screen_message(message: Message) -> None:
+    message_ids = SCREEN_MESSAGE_IDS.setdefault(message.chat.id, [])
+    if message.message_id not in message_ids:
+        message_ids.append(message.message_id)
+
+
+async def answer_flow(message: Message, state: FSMContext, text: str, **kwargs: Any) -> Message:
+    sent = await message.answer(text, **kwargs)
+    remember_screen_message(sent)
+    await remember_flow_message(state, sent)
+    return sent
+
+
+async def answer_final(message: Message, state: FSMContext, text: str, **kwargs: Any) -> Message:
+    await state.clear()
+    return await message.answer(text, **kwargs)
+
+
+async def delete_message_safely(bot: Bot, chat_id: int, message_id: int) -> None:
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except TelegramAPIError:
+        pass
+
+
+async def clear_screen_messages(bot: Bot, chat_id: int) -> None:
+    message_ids = SCREEN_MESSAGE_IDS.pop(chat_id, [])
+    for message_id in reversed(message_ids):
+        await delete_message_safely(bot, chat_id, message_id)
+
+
+async def clear_flow_messages(bot: Bot, state: FSMContext, chat_id: int | None = None) -> None:
+    data = await state.get_data()
+    messages = data.get(FLOW_MESSAGES_KEY, [])
+    seen: set[tuple[int, int]] = set()
+    for item in reversed(messages):
+        key = (item["chat_id"], item["message_id"])
+        if key not in seen:
+            seen.add(key)
+            await delete_message_safely(bot, item["chat_id"], item["message_id"])
+
+    chat_ids = {item["chat_id"] for item in messages}
+    if chat_id is not None:
+        chat_ids.add(chat_id)
+    for current_chat_id in chat_ids:
+        await clear_screen_messages(bot, current_chat_id)
+
+    await state.update_data(**{FLOW_MESSAGES_KEY: []})
+
+
 def sanitize_name(raw_name: str) -> str:
     name = raw_name.strip()
     name = re.sub(r"[^\w\s-]", "_", name, flags=re.UNICODE)
@@ -134,6 +196,21 @@ def safe_child_path(root: Path, name: str) -> Path:
     if root_resolved != candidate and root_resolved not in candidate.parents:
         raise ValueError("Path escapes storage root")
     return candidate
+
+
+def user_id_from(message_or_callback: Message | CallbackQuery) -> int | None:
+    user = message_or_callback.from_user
+    return user.id if user else None
+
+
+def display_path(path: Path) -> str:
+    resolved = path.resolve()
+    for root in (BASE_DIR.resolve(), DATA_DIR.resolve()):
+        try:
+            return resolved.relative_to(root).as_posix()
+        except ValueError:
+            continue
+    return resolved.as_posix()
 
 
 def client_names() -> list[str]:
@@ -269,25 +346,27 @@ def parse_document_values(text: str, fields: list[str]) -> tuple[dict[str, str],
 
 
 async def is_owner(message_or_callback: Message | CallbackQuery) -> bool:
-    user = message_or_callback.from_user
-    if user is None:
+    user_id = user_id_from(message_or_callback)
+    if user_id is None:
         return False
 
-    user_id = str(user.id)
+    configured_owner_id = os.getenv("OWNER_TELEGRAM_ID", "").strip()
+    if configured_owner_id:
+        return configured_owner_id == str(user_id)
+
     ensure_storage()
     if not OWNER_FILE.exists():
-        OWNER_FILE.write_text(user_id, encoding="utf-8")
+        OWNER_FILE.write_text(str(user_id), encoding="utf-8")
         return True
 
-    owner_id = OWNER_FILE.read_text(encoding="utf-8").strip()
-    return owner_id == user_id
+    return OWNER_FILE.read_text(encoding="utf-8").strip() == str(user_id)
 
 
 async def reject_if_not_owner(message_or_callback: Message | CallbackQuery) -> bool:
     if await is_owner(message_or_callback):
         return False
 
-    text = "Этот MVP доступен только пользователю, который первым запустил демо-сессию."
+    text = "Доступ закрыт. Этим ботом может пользоваться только владелец."
     if isinstance(message_or_callback, CallbackQuery):
         await message_or_callback.answer("Доступ закрыт", show_alert=True)
         if message_or_callback.message:
@@ -299,23 +378,25 @@ async def reject_if_not_owner(message_or_callback: Message | CallbackQuery) -> b
 
 async def show_main_menu(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer("Главное меню", reply_markup=main_menu_keyboard())
+    await answer_flow(message, state, "Главное меню", reply_markup=main_menu_keyboard())
 
 
-async def show_client_list(message: Message) -> None:
+async def show_client_list(message: Message, state: FSMContext) -> None:
     clients = client_names()
     if not clients:
-        await message.answer("Клиентов пока нет.", reply_markup=main_menu_keyboard())
+        await answer_flow(message, state, "Главное меню\n\nКлиентов пока нет.", reply_markup=main_menu_keyboard())
         return
 
-    text = "Мои клиенты:\n" + "\n".join(f"- {client}" for client in clients)
-    await message.answer(text, reply_markup=main_menu_keyboard())
+    text = "Главное меню\n\nМои клиенты:\n" + "\n".join(f"- {client}" for client in clients)
+    await answer_flow(message, state, text, reply_markup=main_menu_keyboard())
 
 
 async def show_clients_for_flow(message: Message, state: FSMContext, flow: str) -> None:
     clients = client_names()
     if not clients:
-        await message.answer(
+        await answer_flow(
+            message,
+            state,
             "Пока нет клиентов. Сначала добавьте клиента.",
             reply_markup=menu_inline_keyboard(),
         )
@@ -335,37 +416,45 @@ async def show_clients_for_flow(message: Message, state: FSMContext, flow: str) 
         title = "Выберите клиента для готового документа:"
         prefix = "fill_client"
 
-    await message.answer(title, reply_markup=rows_keyboard(prefix, clients))
+    await answer_flow(message, state, title, reply_markup=rows_keyboard(prefix, clients))
 
 
 @router.message(CommandStart())
-async def start(message: Message, state: FSMContext) -> None:
+async def start(message: Message, state: FSMContext, bot: Bot) -> None:
     if await reject_if_not_owner(message):
         return
+    await clear_flow_messages(bot, state, message.chat.id)
+    await delete_message_safely(bot, message.chat.id, message.message_id)
     await show_main_menu(message, state)
 
 
 @router.callback_query(F.data == "menu")
-async def callback_menu(callback: CallbackQuery, state: FSMContext) -> None:
+async def callback_menu(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     if await reject_if_not_owner(callback):
         return
+    chat_id = callback.message.chat.id if callback.message else None
+    await clear_flow_messages(bot, state, chat_id)
     await state.clear()
     await callback.answer()
     if callback.message:
-        await callback.message.answer("Главное меню", reply_markup=main_menu_keyboard())
+        await answer_flow(callback.message, state, "Главное меню", reply_markup=main_menu_keyboard())
 
 
 @router.message(F.text.in_(MAIN_BUTTONS | NAV_BUTTONS))
-async def main_menu_buttons(message: Message, state: FSMContext) -> None:
+async def main_menu_buttons(message: Message, state: FSMContext, bot: Bot) -> None:
     if await reject_if_not_owner(message):
         return
 
+    await clear_flow_messages(bot, state, message.chat.id)
+    await delete_message_safely(bot, message.chat.id, message.message_id)
     await state.clear()
     if message.text in NAV_BUTTONS:
-        await message.answer("Главное меню", reply_markup=main_menu_keyboard())
+        await answer_flow(message, state, "Главное меню", reply_markup=main_menu_keyboard())
     elif message.text == "Добавить клиента":
         await state.set_state(BotStates.waiting_client_name)
-        await message.answer(
+        await answer_flow(
+            message,
+            state,
             "Введите имя или короткий ID клиента:",
             reply_markup=menu_inline_keyboard(),
         )
@@ -376,7 +465,7 @@ async def main_menu_buttons(message: Message, state: FSMContext) -> None:
     elif message.text == "Заполнить документ":
         await fill_template_start(message, state)
     elif message.text == "Мои клиенты":
-        await show_client_list(message)
+        await show_client_list(message, state)
 
 
 @router.message(F.text == "Добавить клиента")
@@ -384,31 +473,35 @@ async def add_client_start(message: Message, state: FSMContext) -> None:
     if await reject_if_not_owner(message):
         return
     await state.set_state(BotStates.waiting_client_name)
-    await message.answer(
+    await answer_flow(
+        message,
+        state,
         "Введите имя или короткий ID клиента:",
         reply_markup=menu_inline_keyboard(),
     )
 
 
 @router.message(BotStates.waiting_client_name)
-async def add_client_finish(message: Message, state: FSMContext) -> None:
+async def add_client_finish(message: Message, state: FSMContext, bot: Bot) -> None:
     if await reject_if_not_owner(message):
         return
+    await remember_flow_message(state, message)
     if not message.text:
-        await message.answer("Пришлите имя текстом.", reply_markup=menu_inline_keyboard())
+        await answer_flow(message, state, "Пришлите имя текстом.", reply_markup=menu_inline_keyboard())
         return
 
     client_name = sanitize_name(message.text)
     client_path = safe_child_path(CLIENTS_DIR, client_name)
+    await clear_flow_messages(bot, state, message.chat.id)
     if client_path.exists():
         await message.answer(
-            f"Клиент уже есть: data/clients/{client_name}",
+            f"Главное меню\n\nКлиент уже есть: {display_path(client_path)}",
             reply_markup=main_menu_keyboard(),
         )
     else:
         client_path.mkdir(parents=True, exist_ok=False)
         await message.answer(
-            f"Клиент добавлен: data/clients/{client_name}",
+            f"Главное меню\n\nКлиент добавлен: {display_path(client_path)}",
             reply_markup=main_menu_keyboard(),
         )
     await state.clear()
@@ -419,13 +512,7 @@ async def my_clients(message: Message, state: FSMContext) -> None:
     if await reject_if_not_owner(message):
         return
     await state.clear()
-    clients = client_names()
-    if not clients:
-        await message.answer("Клиентов пока нет.", reply_markup=main_menu_keyboard())
-        return
-
-    text = "Мои клиенты:\n" + "\n".join(f"- {client}" for client in clients)
-    await message.answer(text, reply_markup=main_menu_keyboard())
+    await show_client_list(message, state)
 
 
 @router.message(F.text == "Добавить файл")
@@ -450,7 +537,9 @@ async def add_file_choose_client(callback: CallbackQuery, state: FSMContext) -> 
     await state.set_state(BotStates.add_file_waiting_file)
     await callback.answer()
     if callback.message:
-        await callback.message.answer(
+        await answer_flow(
+            callback.message,
+            state,
             "Пришлите файл: pdf, doc, docx, jpg или png. Максимум 20 МБ.",
             reply_markup=menu_inline_keyboard(),
         )
@@ -460,6 +549,7 @@ async def add_file_choose_client(callback: CallbackQuery, state: FSMContext) -> 
 async def add_file_receive(message: Message, state: FSMContext, bot: Bot) -> None:
     if await reject_if_not_owner(message):
         return
+    await remember_flow_message(state, message)
 
     telegram_file_id: str | None = None
     original_name: str | None = None
@@ -476,16 +566,16 @@ async def add_file_receive(message: Message, state: FSMContext, bot: Bot) -> Non
         file_size = photo.file_size or 0
 
     if not telegram_file_id or not original_name:
-        await message.answer("Пришлите файл или фото.", reply_markup=menu_inline_keyboard())
+        await answer_flow(message, state, "Пришлите файл или фото.", reply_markup=menu_inline_keyboard())
         return
 
     if file_size > MAX_FILE_SIZE:
-        await message.answer("Файл слишком большой. Максимум 20 МБ.", reply_markup=menu_inline_keyboard())
+        await answer_flow(message, state, "Файл слишком большой. Максимум 20 МБ.", reply_markup=menu_inline_keyboard())
         return
 
     extension = Path(original_name).suffix.lower()
     if extension not in ALLOWED_EXTENSIONS:
-        await message.answer("Можно загрузить только pdf, doc, docx, jpg или png.", reply_markup=menu_inline_keyboard())
+        await answer_flow(message, state, "Можно загрузить только pdf, doc, docx, jpg или png.", reply_markup=menu_inline_keyboard())
         return
 
     data = await state.get_data()
@@ -496,13 +586,17 @@ async def add_file_receive(message: Message, state: FSMContext, bot: Bot) -> Non
     telegram_file = await bot.get_file(telegram_file_id)
     remote_size = telegram_file.file_size or file_size
     if remote_size > MAX_FILE_SIZE:
-        await message.answer("Файл слишком большой. Максимум 20 МБ.", reply_markup=menu_inline_keyboard())
+        await answer_flow(message, state, "Файл слишком большой. Максимум 20 МБ.", reply_markup=menu_inline_keyboard())
         return
 
     await bot.download_file(telegram_file.file_path, destination=target_path)
+    await clear_flow_messages(bot, state, message.chat.id)
     await state.clear()
-    relative_path = target_path.relative_to(BASE_DIR).as_posix()
-    await message.answer(f"Файл сохранен: {relative_path}", reply_markup=main_menu_keyboard())
+    relative_path = display_path(target_path)
+    await message.answer(
+        f"Главное меню\n\nФайл сохранен: {relative_path}",
+        reply_markup=main_menu_keyboard(),
+    )
 
 
 @router.message(F.text == "Получить файл")
@@ -528,18 +622,28 @@ async def get_file_choose_client(callback: CallbackQuery, state: FSMContext) -> 
     if not files:
         await callback.answer()
         if callback.message:
-            await callback.message.answer("В папке клиента пока нет файлов.", reply_markup=menu_inline_keyboard())
+            await answer_flow(
+                callback.message,
+                state,
+                "В папке клиента пока нет файлов.",
+                reply_markup=menu_inline_keyboard(),
+            )
         return
 
     await state.update_data(selected_client=client_name, files=files)
     await state.set_state(BotStates.get_file_choose_file)
     await callback.answer()
     if callback.message:
-        await callback.message.answer("Выберите файл:", reply_markup=rows_keyboard("get_file", files))
+        await answer_flow(
+            callback.message,
+            state,
+            "Выберите файл:",
+            reply_markup=rows_keyboard("get_file", files),
+        )
 
 
 @router.callback_query(BotStates.get_file_choose_file, F.data.startswith("get_file:"))
-async def get_file_send(callback: CallbackQuery, state: FSMContext) -> None:
+async def get_file_send(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     if await reject_if_not_owner(callback):
         return
     data = await state.get_data()
@@ -551,6 +655,8 @@ async def get_file_send(callback: CallbackQuery, state: FSMContext) -> None:
 
     client_name = data["selected_client"]
     file_path = safe_child_path(safe_child_path(CLIENTS_DIR, client_name), files[index])
+    chat_id = callback.message.chat.id if callback.message else None
+    await clear_flow_messages(bot, state, chat_id)
     await state.clear()
     await callback.answer()
     if callback.message:
@@ -568,12 +674,17 @@ async def fill_template_start(message: Message, state: FSMContext) -> None:
 
     templates = template_names()
     if not templates:
-        await message.answer("В папке templates нет .docx шаблонов.", reply_markup=menu_inline_keyboard())
+        await answer_flow(
+            message,
+            state,
+            "В папке templates нет .docx шаблонов.",
+            reply_markup=menu_inline_keyboard(),
+        )
         return
 
     await state.update_data(templates=templates)
     await state.set_state(BotStates.fill_template_choose_template)
-    await message.answer("Выберите шаблон:", reply_markup=rows_keyboard("template", templates))
+    await answer_flow(message, state, "Выберите шаблон:", reply_markup=rows_keyboard("template", templates))
 
 
 @router.callback_query(BotStates.fill_template_choose_template, F.data.startswith("template:"))
@@ -593,7 +704,12 @@ async def fill_template_choose_template(callback: CallbackQuery, state: FSMConte
     if not fields:
         await callback.answer()
         if callback.message:
-            await callback.message.answer("В шаблоне не найдены поля вида {{field}}.", reply_markup=menu_inline_keyboard())
+            await answer_flow(
+                callback.message,
+                state,
+                "В шаблоне не найдены поля вида {{field}}.",
+                reply_markup=menu_inline_keyboard(),
+            )
         return
 
     await state.update_data(selected_template=template_name, fields=fields, values={})
@@ -618,15 +734,16 @@ async def fill_template_choose_client(callback: CallbackQuery, state: FSMContext
     await state.set_state(BotStates.fill_template_ask_field)
     await callback.answer()
     if callback.message:
-        await callback.message.answer(build_fields_prompt(fields), reply_markup=menu_inline_keyboard())
+        await answer_flow(callback.message, state, build_fields_prompt(fields), reply_markup=menu_inline_keyboard())
 
 
 @router.message(BotStates.fill_template_ask_field)
 async def fill_template_collect_field(message: Message, state: FSMContext) -> None:
     if await reject_if_not_owner(message):
         return
+    await remember_flow_message(state, message)
     if not message.text:
-        await message.answer("Пришлите заполненные данные текстом.", reply_markup=menu_inline_keyboard())
+        await answer_flow(message, state, "Пришлите заполненные данные текстом.", reply_markup=menu_inline_keyboard())
         return
 
     data = await state.get_data()
@@ -634,7 +751,9 @@ async def fill_template_collect_field(message: Message, state: FSMContext) -> No
     values, missing = parse_document_values(message.text, fields)
     if missing:
         missing_labels = ", ".join(field_label(field) for field in missing)
-        await message.answer(
+        await answer_flow(
+            message,
+            state,
             f"Не вижу обязательные поля: {missing_labels}\n\n{build_fields_prompt(fields)}",
             reply_markup=menu_inline_keyboard(),
         )
@@ -650,11 +769,11 @@ async def fill_template_collect_field(message: Message, state: FSMContext) -> No
     for field in fields:
         label = field_label(field)
         lines.append(f"{label}: {mask_value(field, values[field])}")
-    await message.answer("\n".join(lines), reply_markup=confirmation_keyboard())
+    await answer_flow(message, state, "\n".join(lines), reply_markup=confirmation_keyboard())
 
 
 @router.callback_query(BotStates.fill_template_confirm, F.data == "fill:ok")
-async def fill_template_finish(callback: CallbackQuery, state: FSMContext) -> None:
+async def fill_template_finish(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     if await reject_if_not_owner(callback):
         return
 
@@ -670,26 +789,35 @@ async def fill_template_finish(callback: CallbackQuery, state: FSMContext) -> No
     output_path = unique_path(client_folder, output_name)
     fill_docx(template_path, output_path, values)
 
+    chat_id = callback.message.chat.id if callback.message else None
+    await clear_flow_messages(bot, state, chat_id)
     await state.clear()
     await callback.answer()
     if callback.message:
-        relative_path = output_path.relative_to(BASE_DIR).as_posix()
-        await callback.message.answer(f"Документ готов: {relative_path}", reply_markup=main_menu_keyboard())
+        relative_path = display_path(output_path)
+        await callback.message.answer(
+            f"Главное меню\n\nДокумент готов: {relative_path}",
+            reply_markup=main_menu_keyboard(),
+        )
         await callback.message.answer_document(FSInputFile(output_path), caption="Готовый документ")
 
 
 @router.callback_query(BotStates.fill_template_confirm, F.data == "fill:edit")
-async def fill_template_edit(callback: CallbackQuery, state: FSMContext) -> None:
+async def fill_template_edit(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     if await reject_if_not_owner(callback):
         return
 
     data = await state.get_data()
     fields = data["fields"]
     values = data.get("values", {})
+    chat_id = callback.message.chat.id if callback.message else None
+    await clear_flow_messages(bot, state, chat_id)
     await state.set_state(BotStates.fill_template_ask_field)
     await callback.answer()
     if callback.message:
-        await callback.message.answer(
+        await answer_flow(
+            callback.message,
+            state,
             "Ок, поправьте данные и пришлите форму заново:\n\n"
             + build_fields_prompt(fields, values),
             reply_markup=menu_inline_keyboard(),
@@ -707,7 +835,7 @@ async def menu_text(message: Message, state: FSMContext) -> None:
 async def fallback(message: Message, state: FSMContext) -> None:
     if await reject_if_not_owner(message):
         return
-    await message.answer("Выберите действие кнопкой в меню.", reply_markup=main_menu_keyboard())
+    await message.answer("Главное меню\n\nВыберите действие кнопкой в меню.", reply_markup=main_menu_keyboard())
 
 
 async def main() -> None:
