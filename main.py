@@ -27,7 +27,17 @@ from dotenv import load_dotenv
 
 
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
+load_dotenv()
+
+
+def resolve_storage_root(raw_path: str) -> Path:
+    path = Path(raw_path).expanduser()
+    if not path.is_absolute():
+        path = BASE_DIR / path
+    return path.resolve()
+
+
+DATA_DIR = resolve_storage_root(os.getenv("STORAGE_ROOT", "data"))
 CLIENTS_DIR = DATA_DIR / "clients"
 TEMPLATES_DIR = BASE_DIR / "templates"
 OWNER_FILE = DATA_DIR / "owner.txt"
