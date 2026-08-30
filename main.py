@@ -27,17 +27,7 @@ from dotenv import load_dotenv
 
 
 BASE_DIR = Path(__file__).resolve().parent
-load_dotenv()
-
-
-def resolve_storage_root(raw_path: str) -> Path:
-    path = Path(raw_path).expanduser()
-    if not path.is_absolute():
-        path = BASE_DIR / path
-    return path.resolve()
-
-
-DATA_DIR = resolve_storage_root(os.getenv("STORAGE_ROOT", "data"))
+DATA_DIR = BASE_DIR / "data"
 CLIENTS_DIR = DATA_DIR / "clients"
 TEMPLATES_DIR = BASE_DIR / "templates"
 OWNER_FILE = DATA_DIR / "owner.txt"
@@ -349,10 +339,6 @@ async def is_owner(message_or_callback: Message | CallbackQuery) -> bool:
     user_id = user_id_from(message_or_callback)
     if user_id is None:
         return False
-
-    configured_owner_id = os.getenv("OWNER_TELEGRAM_ID", "").strip()
-    if configured_owner_id:
-        return configured_owner_id == str(user_id)
 
     ensure_storage()
     if not OWNER_FILE.exists():

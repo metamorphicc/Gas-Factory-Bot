@@ -1,43 +1,17 @@
 # Telegram Document Assistant MVP
 
-Демо-MVP Telegram-бота для работы одного владельца с клиентскими папками и Word-шаблонами.
-
-## Модель хранения
-
-Файлы хранятся не в Telegram, а на машине, где запущен бот.
-
-Для локального запуска:
-
-```text
-data/clients/<client_name>/
-```
-
-Для серверного запуска с persistent disk:
-
-```text
-/data/clients/<client_name>/
-```
-
-Настройка делается через `.env`:
-
-```env
-BOT_TOKEN=your_telegram_bot_token
-STORAGE_ROOT=/data
-OWNER_TELEGRAM_ID=123456789
-```
-
-`OWNER_TELEGRAM_ID` - Telegram id владельца. Если оставить пустым, первый пользователь, который запустит бота, будет записан в `STORAGE_ROOT/owner.txt` и станет владельцем демо-сессии.
+Демо-MVP Telegram-бота для работы одного владельца с локальными клиентскими папками и Word-шаблонами.
 
 ## Возможности
 
-- один владелец бота
-- добавить клиента и создать папку `clients/<client_name>/`
+- один владелец бота: первый пользователь, который запустил демо, получает доступ
+- добавить клиента и создать папку `data/clients/<client_name>/`
 - загрузить файл клиента: `pdf`, `doc`, `docx`, `jpg`, `png`
 - посмотреть клиентские папки и скачать файл обратно
 - заполнить `.docx` шаблон по найденным полям `{{field}}` одним сообщением
 - сохранить готовый документ в папку клиента и отправить его в чат
 
-## Запуск локально
+## Запуск
 
 ```bash
 pip install -r requirements.txt
@@ -47,8 +21,6 @@ pip install -r requirements.txt
 
 ```env
 BOT_TOKEN=your_telegram_bot_token
-STORAGE_ROOT=data
-OWNER_TELEGRAM_ID=
 ```
 
 Запустите:
@@ -57,22 +29,11 @@ OWNER_TELEGRAM_ID=
 python main.py
 ```
 
-## Запуск на сервере
-
-Чтобы файлы не хранились на вашем ПК, бот должен быть запущен на хостинге/сервере, а `STORAGE_ROOT` должен указывать на постоянный диск.
-
-Минимальные настройки:
+Файлы хранятся локально в:
 
 ```text
-Build command: pip install -r requirements.txt
-Start command: python main.py
-Environment:
-  BOT_TOKEN=...
-  STORAGE_ROOT=/data
-  OWNER_TELEGRAM_ID=ваш_telegram_id
+data/clients/<client_name>/
 ```
-
-Обязательно подключите persistent volume/disk к `/data`. Без него многие PaaS-хостинги удаляют файлы после рестарта или деплоя.
 
 ## Заполнение документа
 
@@ -93,8 +54,7 @@ Environment:
 ## Папки
 
 - `templates/` - Word-шаблоны `.docx`
-- `data/clients/` - локальные клиентские папки при `STORAGE_ROOT=data`
-- `/data/clients/` - серверные клиентские папки при `STORAGE_ROOT=/data`
+- `data/clients/` - локальные клиентские папки
 
 В проекте есть демо-шаблон `templates/demo_client_form.docx` с полями:
 
@@ -105,4 +65,4 @@ Environment:
 
 ## Безопасность
 
-Это MVP demo для клиента, не production IAM. Доступ ограничен одним владельцем через `OWNER_TELEGRAM_ID` или авто-запись первого пользователя в `owner.txt`. Файлы ограничены по типу и размеру, имена папок и файлов очищаются перед сохранением.
+Это MVP demo для клиента, не production IAM. Доступ ограничен первым Telegram-пользователем, который запустил бота; его id хранится в `data/owner.txt`. Файлы ограничены по типу и размеру, имена папок и файлов очищаются перед сохранением.
