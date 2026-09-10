@@ -2,6 +2,5 @@
 __pycache__/
 *.py[cod]
 .venv/
-data/owner.txt
 data/clients/*
 !data/clients/.gitkeep

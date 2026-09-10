@@ -40,7 +40,6 @@ def resolve_storage_root(raw_path: str) -> Path:
 DATA_DIR = resolve_storage_root(os.getenv("STORAGE_ROOT", "data"))
 CLIENTS_DIR = DATA_DIR / "clients"
 TEMPLATES_DIR = BASE_DIR / "templates"
-OWNER_FILE = DATA_DIR / "owner.txt"
 
 ALLOWED_EXTENSIONS = {".pdf", ".doc", ".docx", ".jpg", ".jpeg", ".png"}
 MAX_FILE_SIZE = 20 * 1024 * 1024
@@ -198,11 +197,6 @@ def safe_child_path(root: Path, name: str) -> Path:
     return candidate
 
 
-def user_id_from(message_or_callback: Message | CallbackQuery) -> int | None:
-    user = message_or_callback.from_user
-    return user.id if user else None
-
-
 def display_path(path: Path) -> str:
     resolved = path.resolve()
     for root in (BASE_DIR.resolve(), DATA_DIR.resolve()):
@@ -345,33 +339,6 @@ def parse_document_values(text: str, fields: list[str]) -> tuple[dict[str, str],
     return values, missing
 
 
-async def is_owner(message_or_callback: Message | CallbackQuery) -> bool:
-    user_id = user_id_from(message_or_callback)
-    if user_id is None:
-        return False
-
-    ensure_storage()
-    if not OWNER_FILE.exists():
-        OWNER_FILE.write_text(str(user_id), encoding="utf-8")
-        return True
-
-    return OWNER_FILE.read_text(encoding="utf-8").strip() == str(user_id)
-
-
-async def reject_if_not_owner(message_or_callback: Message | CallbackQuery) -> bool:
-    if await is_owner(message_or_callback):
-        return False
-
-    text = "Доступ закрыт. Этим ботом может пользоваться только владелец."
-    if isinstance(message_or_callback, CallbackQuery):
-        await message_or_callback.answer("Доступ закрыт", show_alert=True)
-        if message_or_callback.message:
-            await message_or_callback.message.answer(text)
-    else:
-        await message_or_callback.answer(text)
-    return True
-
-
 async def show_main_menu(message: Message, state: FSMContext) -> None:
     await state.clear()
     await answer_flow(message, state, "Главное меню", reply_markup=main_menu_keyboard())
@@ -417,8 +384,6 @@ async def show_clients_for_flow(message: Message, state: FSMContext, flow: str) 
 
 @router.message(CommandStart())
 async def start(message: Message, state: FSMContext, bot: Bot) -> None:
-    if await reject_if_not_owner(message):
-        return
     await clear_flow_messages(bot, state, message.chat.id)
     await delete_message_safely(bot, message.chat.id, message.message_id)
     await show_main_menu(message, state)
@@ -426,8 +391,6 @@ async def start(message: Message, state: FSMContext, bot: Bot) -> None:
 
 @router.callback_query(F.data == "menu")
 async def callback_menu(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
-    if await reject_if_not_owner(callback):
-        return
     chat_id = callback.message.chat.id if callback.message else None
     await clear_flow_messages(bot, state, chat_id)
     await state.clear()
@@ -438,8 +401,6 @@ async def callback_menu(callback: CallbackQuery, state: FSMContext, bot: Bot) ->
 
 @router.message(F.text.in_(MAIN_BUTTONS | NAV_BUTTONS))
 async def main_menu_buttons(message: Message, state: FSMContext, bot: Bot) -> None:
-    if await reject_if_not_owner(message):
-        return
 
     await clear_flow_messages(bot, state, message.chat.id)
     await delete_message_safely(bot, message.chat.id, message.message_id)
@@ -466,8 +427,6 @@ async def main_menu_buttons(message: Message, state: FSMContext, bot: Bot) -> No
 
 @router.message(F.text == "Добавить клиента")
 async def add_client_start(message: Message, state: FSMContext) -> None:
-    if await reject_if_not_owner(message):
-        return
     await state.set_state(BotStates.waiting_client_name)
     await answer_flow(
         message,
@@ -479,8 +438,6 @@ async def add_client_start(message: Message, state: FSMContext) -> None:
 
 @router.message(BotStates.waiting_client_name)
 async def add_client_finish(message: Message, state: FSMContext, bot: Bot) -> None:
-    if await reject_if_not_owner(message):
-        return
     await remember_flow_message(state, message)
     if not message.text:
         await answer_flow(message, state, "Пришлите имя текстом.", reply_markup=menu_inline_keyboard())
@@ -505,23 +462,17 @@ async def add_client_finish(message: Message, state: FSMContext, bot: Bot) -> No
 
 @router.message(F.text == "Мои клиенты")
 async def my_clients(message: Message, state: FSMContext) -> None:
-    if await reject_if_not_owner(message):
-        return
     await state.clear()
     await show_client_list(message, state)
 
 
 @router.message(F.text == "Добавить файл")
 async def add_file_start(message: Message, state: FSMContext) -> None:
-    if await reject_if_not_owner(message):
-        return
     await show_clients_for_flow(message, state, "add")
 
 
 @router.callback_query(BotStates.add_file_choose_client, F.data.startswith("add_client:"))
 async def add_file_choose_client(callback: CallbackQuery, state: FSMContext) -> None:
-    if await reject_if_not_owner(callback):
-        return
     data = await state.get_data()
     clients = data.get("clients", [])
     index = int(callback.data.split(":", 1)[1])
@@ -543,8 +494,6 @@ async def add_file_choose_client(callback: CallbackQuery, state: FSMContext) -> 
 
 @router.message(BotStates.add_file_waiting_file)
 async def add_file_receive(message: Message, state: FSMContext, bot: Bot) -> None:
-    if await reject_if_not_owner(message):
-        return
     await remember_flow_message(state, message)
 
     telegram_file_id: str | None = None
@@ -597,15 +546,11 @@ async def add_file_receive(message: Message, state: FSMContext, bot: Bot) -> Non
 
 @router.message(F.text == "Получить файл")
 async def get_file_start(message: Message, state: FSMContext) -> None:
-    if await reject_if_not_owner(message):
-        return
     await show_clients_for_flow(message, state, "get")
 
 
 @router.callback_query(BotStates.get_file_choose_client, F.data.startswith("get_client:"))
 async def get_file_choose_client(callback: CallbackQuery, state: FSMContext) -> None:
-    if await reject_if_not_owner(callback):
-        return
     data = await state.get_data()
     clients = data.get("clients", [])
     index = int(callback.data.split(":", 1)[1])
@@ -640,8 +585,6 @@ async def get_file_choose_client(callback: CallbackQuery, state: FSMContext) -> 
 
 @router.callback_query(BotStates.get_file_choose_file, F.data.startswith("get_file:"))
 async def get_file_send(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
-    if await reject_if_not_owner(callback):
-        return
     data = await state.get_data()
     files = data.get("files", [])
     index = int(callback.data.split(":", 1)[1])
@@ -665,8 +608,6 @@ async def get_file_send(callback: CallbackQuery, state: FSMContext, bot: Bot) ->
 
 @router.message(F.text == "Заполнить документ")
 async def fill_template_start(message: Message, state: FSMContext) -> None:
-    if await reject_if_not_owner(message):
-        return
 
     templates = template_names()
     if not templates:
@@ -685,8 +626,6 @@ async def fill_template_start(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(BotStates.fill_template_choose_template, F.data.startswith("template:"))
 async def fill_template_choose_template(callback: CallbackQuery, state: FSMContext) -> None:
-    if await reject_if_not_owner(callback):
-        return
     data = await state.get_data()
     templates = data.get("templates", [])
     index = int(callback.data.split(":", 1)[1])
@@ -716,8 +655,6 @@ async def fill_template_choose_template(callback: CallbackQuery, state: FSMConte
 
 @router.callback_query(BotStates.fill_template_choose_client, F.data.startswith("fill_client:"))
 async def fill_template_choose_client(callback: CallbackQuery, state: FSMContext) -> None:
-    if await reject_if_not_owner(callback):
-        return
     data = await state.get_data()
     clients = data.get("clients", [])
     index = int(callback.data.split(":", 1)[1])
@@ -735,8 +672,6 @@ async def fill_template_choose_client(callback: CallbackQuery, state: FSMContext
 
 @router.message(BotStates.fill_template_ask_field)
 async def fill_template_collect_field(message: Message, state: FSMContext) -> None:
-    if await reject_if_not_owner(message):
-        return
     await remember_flow_message(state, message)
     if not message.text:
         await answer_flow(message, state, "Пришлите заполненные данные текстом.", reply_markup=menu_inline_keyboard())
@@ -770,8 +705,6 @@ async def fill_template_collect_field(message: Message, state: FSMContext) -> No
 
 @router.callback_query(BotStates.fill_template_confirm, F.data == "fill:ok")
 async def fill_template_finish(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
-    if await reject_if_not_owner(callback):
-        return
 
     data = await state.get_data()
     client_name = data["selected_client"]
@@ -800,8 +733,6 @@ async def fill_template_finish(callback: CallbackQuery, state: FSMContext, bot: 
 
 @router.callback_query(BotStates.fill_template_confirm, F.data == "fill:edit")
 async def fill_template_edit(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
-    if await reject_if_not_owner(callback):
-        return
 
     data = await state.get_data()
     fields = data["fields"]
@@ -822,15 +753,11 @@ async def fill_template_edit(callback: CallbackQuery, state: FSMContext, bot: Bo
 
 @router.message(F.text.in_({"Меню", "В меню"}))
 async def menu_text(message: Message, state: FSMContext) -> None:
-    if await reject_if_not_owner(message):
-        return
     await show_main_menu(message, state)
 
 
 @router.message()
 async def fallback(message: Message, state: FSMContext) -> None:
-    if await reject_if_not_owner(message):
-        return
     await message.answer("Главное меню\n\nВыберите действие кнопкой в меню.", reply_markup=main_menu_keyboard())
 
 
