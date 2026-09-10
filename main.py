@@ -102,6 +102,15 @@ def menu_inline_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def upload_done_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Оставить как есть", callback_data="add_file:done")],
+            [InlineKeyboardButton(text="В меню", callback_data="menu")],
+        ]
+    )
+
+
 def confirmation_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -280,6 +289,60 @@ def sanitize_filename(raw_filename: str) -> str:
     stem = sanitize_name(path.stem)
     suffix = path.suffix.lower()
     return f"{stem}{suffix}" if suffix else stem
+
+
+def rename_target_path(source_path: Path, requested_name: str) -> Path:
+    clean_stem = sanitize_name(Path(requested_name.strip()).stem)
+    filename = f"{clean_stem}{source_path.suffix.lower()}"
+    if filename == source_path.name:
+        return source_path
+    return unique_path(source_path.parent, filename)
+
+
+def build_upload_rename_prompt(uploaded_files: list[dict[str, str]]) -> str:
+    count = len(uploaded_files)
+    if count == 1:
+        return (
+            "Файл сохранен.\n\n"
+            "Если хотите присвоить ему нормальное имя, напишите его одним сообщением.\n"
+            "Расширение файла сохранится автоматически."
+        )
+
+    examples = "\n".join("название файла" for _ in uploaded_files)
+    return (
+        f"Распознаны файлы: {count} шт.\n\n"
+        "Если хотите присвоить им нормальные имена, напишите их в формате по одному имени на строку:\n\n"
+        f"{examples}\n\n"
+        "Расширения файлов сохранятся автоматически."
+    )
+
+
+def uploaded_files_summary(uploaded_files: list[dict[str, str]]) -> str:
+    lines = [f"Файлы сохранены: {len(uploaded_files)} шт."]
+    for file_info in uploaded_files:
+        lines.append(f"- {file_info['display_path']}")
+    return "\n".join(lines)
+
+
+def rename_uploaded_files(uploaded_files: list[dict[str, str]], names: list[str]) -> list[dict[str, str]]:
+    renamed: list[dict[str, str]] = []
+    for file_info, requested_name in zip(uploaded_files, names):
+        source_path = Path(file_info["path"])
+        if not source_path.exists():
+            renamed.append(file_info)
+            continue
+
+        target_path = rename_target_path(source_path, requested_name)
+        if target_path != source_path:
+            source_path.replace(target_path)
+
+        renamed.append(
+            {
+                "path": str(target_path),
+                "display_path": display_path(target_path),
+            }
+        )
+    return renamed
 
 
 def mask_value(field: str, value: str) -> str:
@@ -480,14 +543,14 @@ async def add_file_choose_client(callback: CallbackQuery, state: FSMContext) -> 
         await callback.answer("Клиент не найден", show_alert=True)
         return
 
-    await state.update_data(selected_client=clients[index])
+    await state.update_data(selected_client=clients[index], uploaded_files=[])
     await state.set_state(BotStates.add_file_waiting_file)
     await callback.answer()
     if callback.message:
         await answer_flow(
             callback.message,
             state,
-            "Пришлите файл: pdf, doc, docx, jpg или png. Максимум 20 МБ.",
+            "Пришлите один или несколько файлов: pdf, doc, docx, jpg или png. Максимум 20 МБ на файл.",
             reply_markup=menu_inline_keyboard(),
         )
 
@@ -495,6 +558,40 @@ async def add_file_choose_client(callback: CallbackQuery, state: FSMContext) -> 
 @router.message(BotStates.add_file_waiting_file)
 async def add_file_receive(message: Message, state: FSMContext, bot: Bot) -> None:
     await remember_flow_message(state, message)
+
+    data = await state.get_data()
+    uploaded_files = data.get("uploaded_files", [])
+
+    if message.text and uploaded_files:
+        if not message.text.strip():
+            await answer_flow(message, state, "Пришлите непустое имя файла.", reply_markup=upload_done_keyboard())
+            return
+
+        names = [line.strip() for line in message.text.splitlines() if line.strip()]
+        if len(uploaded_files) == 1:
+            names = [message.text.strip()]
+        elif len(names) != len(uploaded_files):
+            await answer_flow(
+                message,
+                state,
+                (
+                    f"Нужно прислать {len(uploaded_files)} имен, по одному на строку.\n\n"
+                    + build_upload_rename_prompt(uploaded_files)
+                ),
+                reply_markup=upload_done_keyboard(),
+            )
+            return
+
+        renamed_files = rename_uploaded_files(uploaded_files, names)
+        await state.update_data(uploaded_files=renamed_files)
+        await clear_flow_messages(bot, state, message.chat.id)
+        await state.clear()
+        await message.answer(
+            "Главное меню\n\n"
+            + uploaded_files_summary(renamed_files),
+            reply_markup=main_menu_keyboard(),
+        )
+        return
 
     telegram_file_id: str | None = None
     original_name: str | None = None
@@ -535,13 +632,41 @@ async def add_file_receive(message: Message, state: FSMContext, bot: Bot) -> Non
         return
 
     await bot.download_file(telegram_file.file_path, destination=target_path)
-    await clear_flow_messages(bot, state, message.chat.id)
-    await state.clear()
-    relative_path = display_path(target_path)
-    await message.answer(
-        f"Главное меню\n\nФайл сохранен: {relative_path}",
-        reply_markup=main_menu_keyboard(),
+    saved_files = data.get("uploaded_files", [])
+    saved_files.append(
+        {
+            "path": str(target_path),
+            "display_path": display_path(target_path),
+        }
     )
+    await state.update_data(uploaded_files=saved_files)
+    await clear_screen_messages(bot, message.chat.id)
+    await answer_flow(
+        message,
+        state,
+        build_upload_rename_prompt(saved_files),
+        reply_markup=upload_done_keyboard(),
+    )
+
+
+@router.callback_query(BotStates.add_file_waiting_file, F.data == "add_file:done")
+async def add_file_finish_without_rename(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    data = await state.get_data()
+    uploaded_files = data.get("uploaded_files", [])
+    if not uploaded_files:
+        await callback.answer("Сначала пришлите файл", show_alert=True)
+        return
+
+    chat_id = callback.message.chat.id if callback.message else None
+    await clear_flow_messages(bot, state, chat_id)
+    await state.clear()
+    await callback.answer()
+    if callback.message:
+        await callback.message.answer(
+            "Главное меню\n\n"
+            + uploaded_files_summary(uploaded_files),
+            reply_markup=main_menu_keyboard(),
+        )
 
 
 @router.message(F.text == "Получить файл")
