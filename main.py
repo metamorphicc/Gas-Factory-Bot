@@ -24,6 +24,8 @@ from aiogram.types import (
 )
 from docx import Document
 from dotenv import load_dotenv
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Font, PatternFill
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -40,12 +42,28 @@ def resolve_storage_root(raw_path: str) -> Path:
 DATA_DIR = resolve_storage_root(os.getenv("STORAGE_ROOT", "data"))
 CLIENTS_DIR = DATA_DIR / "clients"
 TEMPLATES_DIR = BASE_DIR / "templates"
+CLIENTS_EXCEL_PATH = DATA_DIR / "clients.xlsx"
 
 ALLOWED_EXTENSIONS = {".pdf", ".doc", ".docx", ".jpg", ".jpeg", ".png"}
 MAX_FILE_SIZE = 20 * 1024 * 1024
 PLACEHOLDER_RE = re.compile(r"{{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*}}")
 FLOW_MESSAGES_KEY = "flow_message_ids"
 SCREEN_MESSAGE_IDS: dict[int, list[int]] = {}
+CLIENTS_SHEET_NAME = "clients"
+CLIENTS_HEADERS = [
+    "created_at",
+    "updated_at",
+    "client_name",
+    "folder",
+    "files_count",
+    "last_file",
+    "full_name",
+    "passport",
+    "inn",
+    "date",
+    "last_template",
+    "last_document",
+]
 
 FIELD_LABELS = {
     "full_name": "ФИО",
@@ -82,6 +100,103 @@ router = Router()
 def ensure_storage() -> None:
     CLIENTS_DIR.mkdir(parents=True, exist_ok=True)
     TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_clients_workbook()
+
+
+def now_text() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def style_clients_sheet(workbook: Workbook) -> None:
+    worksheet = workbook[CLIENTS_SHEET_NAME]
+    header_fill = PatternFill("solid", fgColor="D9EAF7")
+    for cell in worksheet[1]:
+        cell.font = Font(bold=True)
+        cell.fill = header_fill
+    worksheet.freeze_panes = "A2"
+    widths = {
+        "A": 19,
+        "B": 19,
+        "C": 24,
+        "D": 38,
+        "E": 12,
+        "F": 32,
+        "G": 28,
+        "H": 18,
+        "I": 18,
+        "J": 14,
+        "K": 28,
+        "L": 38,
+    }
+    for column, width in widths.items():
+        worksheet.column_dimensions[column].width = width
+
+
+def ensure_clients_workbook() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if not CLIENTS_EXCEL_PATH.exists():
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.title = CLIENTS_SHEET_NAME
+        worksheet.append(CLIENTS_HEADERS)
+        style_clients_sheet(workbook)
+        workbook.save(CLIENTS_EXCEL_PATH)
+        return
+
+    workbook = load_workbook(CLIENTS_EXCEL_PATH)
+    if CLIENTS_SHEET_NAME not in workbook.sheetnames:
+        worksheet = workbook.create_sheet(CLIENTS_SHEET_NAME)
+        worksheet.append(CLIENTS_HEADERS)
+        style_clients_sheet(workbook)
+        workbook.save(CLIENTS_EXCEL_PATH)
+        return
+
+    worksheet = workbook[CLIENTS_SHEET_NAME]
+    existing_headers = [cell.value for cell in worksheet[1]]
+    changed = False
+    for header in CLIENTS_HEADERS:
+        if header not in existing_headers:
+            worksheet.cell(row=1, column=len(existing_headers) + 1, value=header)
+            existing_headers.append(header)
+            changed = True
+
+    if changed:
+        style_clients_sheet(workbook)
+        workbook.save(CLIENTS_EXCEL_PATH)
+
+
+def clients_header_map(worksheet: Any) -> dict[str, int]:
+    return {cell.value: cell.column for cell in worksheet[1] if cell.value}
+
+
+def find_client_row(worksheet: Any, headers: dict[str, int], client_name: str) -> int | None:
+    client_column = headers["client_name"]
+    for row in range(2, worksheet.max_row + 1):
+        if worksheet.cell(row=row, column=client_column).value == client_name:
+            return row
+    return None
+
+
+def upsert_client_record(client_name: str, updates: dict[str, Any] | None = None) -> None:
+    ensure_clients_workbook()
+    workbook = load_workbook(CLIENTS_EXCEL_PATH)
+    worksheet = workbook[CLIENTS_SHEET_NAME]
+    headers = clients_header_map(worksheet)
+    row = find_client_row(worksheet, headers, client_name)
+    current_time = now_text()
+
+    if row is None:
+        row = worksheet.max_row + 1
+        worksheet.cell(row=row, column=headers["created_at"], value=current_time)
+        worksheet.cell(row=row, column=headers["client_name"], value=client_name)
+
+    worksheet.cell(row=row, column=headers["updated_at"], value=current_time)
+    for key, value in (updates or {}).items():
+        if key in headers:
+            worksheet.cell(row=row, column=headers[key], value=value)
+
+    style_clients_sheet(workbook)
+    workbook.save(CLIENTS_EXCEL_PATH)
 
 
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
@@ -345,6 +460,20 @@ def rename_uploaded_files(uploaded_files: list[dict[str, str]], names: list[str]
     return renamed
 
 
+def update_client_files_record(client_name: str, last_file_path: Path | None = None) -> None:
+    client_folder = safe_child_path(CLIENTS_DIR, client_name)
+    files = file_names(client_name)
+    updates: dict[str, Any] = {
+        "folder": display_path(client_folder),
+        "files_count": len(files),
+    }
+    if last_file_path is not None:
+        updates["last_file"] = display_path(last_file_path)
+    elif files:
+        updates["last_file"] = display_path(safe_child_path(client_folder, files[-1]))
+    upsert_client_record(client_name, updates)
+
+
 def mask_value(field: str, value: str) -> str:
     if field not in {"passport", "inn"}:
         return value
@@ -510,12 +639,20 @@ async def add_client_finish(message: Message, state: FSMContext, bot: Bot) -> No
     client_path = safe_child_path(CLIENTS_DIR, client_name)
     await clear_flow_messages(bot, state, message.chat.id)
     if client_path.exists():
+        update_client_files_record(client_name)
         await message.answer(
             f"Главное меню\n\nКлиент уже есть: {display_path(client_path)}",
             reply_markup=main_menu_keyboard(),
         )
     else:
         client_path.mkdir(parents=True, exist_ok=False)
+        upsert_client_record(
+            client_name,
+            {
+                "folder": display_path(client_path),
+                "files_count": 0,
+            },
+        )
         await message.answer(
             f"Главное меню\n\nКлиент добавлен: {display_path(client_path)}",
             reply_markup=main_menu_keyboard(),
@@ -583,6 +720,8 @@ async def add_file_receive(message: Message, state: FSMContext, bot: Bot) -> Non
             return
 
         renamed_files = rename_uploaded_files(uploaded_files, names)
+        if renamed_files:
+            update_client_files_record(data["selected_client"], Path(renamed_files[-1]["path"]))
         await state.update_data(uploaded_files=renamed_files)
         await clear_flow_messages(bot, state, message.chat.id)
         await state.clear()
@@ -632,6 +771,7 @@ async def add_file_receive(message: Message, state: FSMContext, bot: Bot) -> Non
         return
 
     await bot.download_file(telegram_file.file_path, destination=target_path)
+    update_client_files_record(client_name, target_path)
     saved_files = data.get("uploaded_files", [])
     saved_files.append(
         {
@@ -658,6 +798,7 @@ async def add_file_finish_without_rename(callback: CallbackQuery, state: FSMCont
         return
 
     chat_id = callback.message.chat.id if callback.message else None
+    update_client_files_record(data["selected_client"], Path(uploaded_files[-1]["path"]))
     await clear_flow_messages(bot, state, chat_id)
     await state.clear()
     await callback.answer()
@@ -842,6 +983,19 @@ async def fill_template_finish(callback: CallbackQuery, state: FSMContext, bot: 
     output_name = f"{Path(template_name).stem}_{timestamp}.docx"
     output_path = unique_path(client_folder, output_name)
     fill_docx(template_path, output_path, values)
+    upsert_client_record(
+        client_name,
+        {
+            "folder": display_path(client_folder),
+            "files_count": len(file_names(client_name)),
+            "full_name": values.get("full_name", ""),
+            "passport": values.get("passport", ""),
+            "inn": values.get("inn", ""),
+            "date": values.get("date", ""),
+            "last_template": template_name,
+            "last_document": display_path(output_path),
+        },
+    )
 
     chat_id = callback.message.chat.id if callback.message else None
     await clear_flow_messages(bot, state, chat_id)
