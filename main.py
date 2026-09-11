@@ -90,7 +90,9 @@ MAIN_BUTTONS = {
     "Добавить клиента",
     "Добавить файл",
     "Получить файл",
+    "Переименовать файл",
     "Заполнить документ",
+    "Таблица клиентов",
     "Мои клиенты",
 }
 NAV_BUTTONS = {"Меню", "В меню"}
@@ -102,6 +104,9 @@ class BotStates(StatesGroup):
     add_file_waiting_file = State()
     get_file_choose_client = State()
     get_file_choose_file = State()
+    rename_file_choose_client = State()
+    rename_file_choose_file = State()
+    rename_file_waiting_name = State()
     fill_template_choose_template = State()
     fill_template_choose_client = State()
     fill_template_ask_field = State()
@@ -224,7 +229,8 @@ def main_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="Добавить клиента"), KeyboardButton(text="Добавить файл")],
-            [KeyboardButton(text="Получить файл"), KeyboardButton(text="Заполнить документ")],
+            [KeyboardButton(text="Получить файл"), KeyboardButton(text="Переименовать файл")],
+            [KeyboardButton(text="Заполнить документ"), KeyboardButton(text="Таблица клиентов")],
             [KeyboardButton(text="Мои клиенты")],
         ],
         resize_keyboard=True,
@@ -587,12 +593,25 @@ async def show_clients_for_flow(message: Message, state: FSMContext, flow: str) 
         await state.set_state(BotStates.get_file_choose_client)
         title = "Выберите клиента:"
         prefix = "get_client"
+    elif flow == "rename":
+        await state.set_state(BotStates.rename_file_choose_client)
+        title = "Выберите клиента, у которого нужно переименовать файл:"
+        prefix = "rename_client"
     else:
         await state.set_state(BotStates.fill_template_choose_client)
         title = "Выберите клиента для готового документа:"
         prefix = "fill_client"
 
     await answer_flow(message, state, title, reply_markup=rows_keyboard(prefix, clients))
+
+
+async def send_clients_table(message: Message) -> None:
+    ensure_storage()
+    await message.answer_document(
+        FSInputFile(CLIENTS_EXCEL_PATH),
+        caption="Главное меню\n\nТаблица клиентов",
+        reply_markup=main_menu_keyboard(),
+    )
 
 
 @router.message(CommandStart())
@@ -632,8 +651,12 @@ async def main_menu_buttons(message: Message, state: FSMContext, bot: Bot) -> No
         await show_clients_for_flow(message, state, "add")
     elif message.text == "Получить файл":
         await show_clients_for_flow(message, state, "get")
+    elif message.text == "Переименовать файл":
+        await show_clients_for_flow(message, state, "rename")
     elif message.text == "Заполнить документ":
         await fill_template_start(message, state)
+    elif message.text == "Таблица клиентов":
+        await send_clients_table(message)
     elif message.text == "Мои клиенты":
         await show_client_list(message, state)
 
@@ -836,6 +859,17 @@ async def get_file_start(message: Message, state: FSMContext) -> None:
     await show_clients_for_flow(message, state, "get")
 
 
+@router.message(F.text == "Переименовать файл")
+async def rename_file_start(message: Message, state: FSMContext) -> None:
+    await show_clients_for_flow(message, state, "rename")
+
+
+@router.message(F.text == "Таблица клиентов")
+async def clients_table(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await send_clients_table(message)
+
+
 @router.callback_query(BotStates.get_file_choose_client, F.data.startswith("get_client:"))
 async def get_file_choose_client(callback: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
@@ -891,6 +925,90 @@ async def get_file_send(callback: CallbackQuery, state: FSMContext, bot: Bot) ->
             caption=f"Файл: {files[index]}",
             reply_markup=main_menu_keyboard(),
         )
+
+
+@router.callback_query(BotStates.rename_file_choose_client, F.data.startswith("rename_client:"))
+async def rename_file_choose_client(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    clients = data.get("clients", [])
+    index = int(callback.data.split(":", 1)[1])
+    if index >= len(clients):
+        await callback.answer("Клиент не найден", show_alert=True)
+        return
+
+    client_name = clients[index]
+    files = file_names(client_name)
+    if not files:
+        await callback.answer()
+        if callback.message:
+            await answer_flow(
+                callback.message,
+                state,
+                "В папке клиента пока нет файлов.",
+                reply_markup=menu_inline_keyboard(),
+            )
+        return
+
+    await state.update_data(selected_client=client_name, files=files)
+    await state.set_state(BotStates.rename_file_choose_file)
+    await callback.answer()
+    if callback.message:
+        await answer_flow(
+            callback.message,
+            state,
+            "Выберите файл, который нужно переименовать:",
+            reply_markup=rows_keyboard("rename_file", files),
+        )
+
+
+@router.callback_query(BotStates.rename_file_choose_file, F.data.startswith("rename_file:"))
+async def rename_file_choose_file(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    files = data.get("files", [])
+    index = int(callback.data.split(":", 1)[1])
+    if index >= len(files):
+        await callback.answer("Файл не найден", show_alert=True)
+        return
+
+    await state.update_data(selected_file=files[index])
+    await state.set_state(BotStates.rename_file_waiting_name)
+    await callback.answer()
+    if callback.message:
+        await answer_flow(
+            callback.message,
+            state,
+            "Напишите новое имя файла. Расширение сохранится автоматически.",
+            reply_markup=menu_inline_keyboard(),
+        )
+
+
+@router.message(BotStates.rename_file_waiting_name)
+async def rename_file_finish(message: Message, state: FSMContext, bot: Bot) -> None:
+    await remember_flow_message(state, message)
+    if not message.text or not message.text.strip():
+        await answer_flow(message, state, "Пришлите новое имя текстом.", reply_markup=menu_inline_keyboard())
+        return
+
+    data = await state.get_data()
+    client_name = data["selected_client"]
+    old_name = data["selected_file"]
+    old_path = safe_child_path(safe_child_path(CLIENTS_DIR, client_name), old_name)
+    if not old_path.exists():
+        await answer_flow(message, state, "Файл уже не найден в папке клиента.", reply_markup=menu_inline_keyboard())
+        return
+
+    new_path = rename_target_path(old_path, message.text.strip())
+    if new_path != old_path:
+        old_path.replace(new_path)
+
+    update_client_files_record(client_name, new_path)
+    await clear_flow_messages(bot, state, message.chat.id)
+    await state.clear()
+    await message.answer(
+        "Главное меню\n\n"
+        f"Файл переименован:\n{display_path(new_path)}",
+        reply_markup=main_menu_keyboard(),
+    )
 
 
 @router.message(F.text == "Заполнить документ")
