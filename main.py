@@ -51,19 +51,33 @@ FLOW_MESSAGES_KEY = "flow_message_ids"
 SCREEN_MESSAGE_IDS: dict[int, list[int]] = {}
 CLIENTS_SHEET_NAME = "clients"
 CLIENTS_HEADERS = [
-    "created_at",
-    "updated_at",
-    "client_name",
-    "folder",
-    "files_count",
-    "last_file",
-    "full_name",
-    "passport",
-    "inn",
-    "date",
-    "last_template",
-    "last_document",
+    "Создан",
+    "Обновлен",
+    "Клиент",
+    "Папка клиента",
+    "Файлов",
+    "Последний файл",
+    "ФИО",
+    "Паспорт",
+    "ИНН",
+    "Дата",
+    "Шаблон",
+    "Готовый документ",
 ]
+CLIENTS_HEADER_ALIASES = {
+    "created_at": "Создан",
+    "updated_at": "Обновлен",
+    "client_name": "Клиент",
+    "folder": "Папка клиента",
+    "files_count": "Файлов",
+    "last_file": "Последний файл",
+    "full_name": "ФИО",
+    "passport": "Паспорт",
+    "inn": "ИНН",
+    "date": "Дата",
+    "last_template": "Шаблон",
+    "last_document": "Готовый документ",
+}
 
 FIELD_LABELS = {
     "full_name": "ФИО",
@@ -154,6 +168,13 @@ def ensure_clients_workbook() -> None:
     worksheet = workbook[CLIENTS_SHEET_NAME]
     existing_headers = [cell.value for cell in worksheet[1]]
     changed = False
+    for index, header in enumerate(existing_headers, start=1):
+        russian_header = CLIENTS_HEADER_ALIASES.get(str(header))
+        if russian_header:
+            worksheet.cell(row=1, column=index, value=russian_header)
+            existing_headers[index - 1] = russian_header
+            changed = True
+
     for header in CLIENTS_HEADERS:
         if header not in existing_headers:
             worksheet.cell(row=1, column=len(existing_headers) + 1, value=header)
@@ -170,7 +191,7 @@ def clients_header_map(worksheet: Any) -> dict[str, int]:
 
 
 def find_client_row(worksheet: Any, headers: dict[str, int], client_name: str) -> int | None:
-    client_column = headers["client_name"]
+    client_column = headers["Клиент"]
     for row in range(2, worksheet.max_row + 1):
         if worksheet.cell(row=row, column=client_column).value == client_name:
             return row
@@ -187,10 +208,10 @@ def upsert_client_record(client_name: str, updates: dict[str, Any] | None = None
 
     if row is None:
         row = worksheet.max_row + 1
-        worksheet.cell(row=row, column=headers["created_at"], value=current_time)
-        worksheet.cell(row=row, column=headers["client_name"], value=client_name)
+        worksheet.cell(row=row, column=headers["Создан"], value=current_time)
+        worksheet.cell(row=row, column=headers["Клиент"], value=client_name)
 
-    worksheet.cell(row=row, column=headers["updated_at"], value=current_time)
+    worksheet.cell(row=row, column=headers["Обновлен"], value=current_time)
     for key, value in (updates or {}).items():
         if key in headers:
             worksheet.cell(row=row, column=headers[key], value=value)
@@ -464,13 +485,13 @@ def update_client_files_record(client_name: str, last_file_path: Path | None = N
     client_folder = safe_child_path(CLIENTS_DIR, client_name)
     files = file_names(client_name)
     updates: dict[str, Any] = {
-        "folder": display_path(client_folder),
-        "files_count": len(files),
+        "Папка клиента": display_path(client_folder),
+        "Файлов": len(files),
     }
     if last_file_path is not None:
-        updates["last_file"] = display_path(last_file_path)
+        updates["Последний файл"] = display_path(last_file_path)
     elif files:
-        updates["last_file"] = display_path(safe_child_path(client_folder, files[-1]))
+        updates["Последний файл"] = display_path(safe_child_path(client_folder, files[-1]))
     upsert_client_record(client_name, updates)
 
 
@@ -649,8 +670,8 @@ async def add_client_finish(message: Message, state: FSMContext, bot: Bot) -> No
         upsert_client_record(
             client_name,
             {
-                "folder": display_path(client_path),
-                "files_count": 0,
+                "Папка клиента": display_path(client_path),
+                "Файлов": 0,
             },
         )
         await message.answer(
@@ -986,14 +1007,14 @@ async def fill_template_finish(callback: CallbackQuery, state: FSMContext, bot: 
     upsert_client_record(
         client_name,
         {
-            "folder": display_path(client_folder),
-            "files_count": len(file_names(client_name)),
-            "full_name": values.get("full_name", ""),
-            "passport": values.get("passport", ""),
-            "inn": values.get("inn", ""),
-            "date": values.get("date", ""),
-            "last_template": template_name,
-            "last_document": display_path(output_path),
+            "Папка клиента": display_path(client_folder),
+            "Файлов": len(file_names(client_name)),
+            "ФИО": values.get("full_name", ""),
+            "Паспорт": values.get("passport", ""),
+            "ИНН": values.get("inn", ""),
+            "Дата": values.get("date", ""),
+            "Шаблон": template_name,
+            "Готовый документ": display_path(output_path),
         },
     )
 
